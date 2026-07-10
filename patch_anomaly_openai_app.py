@@ -1,30 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-GitHub 모델 연동 Patch 이상 탐지 + Gemini 해석 Streamlit 앱
+위치 기반 Patch 이상 탐지 + Gemini 보조 해석 Streamlit 앱
 
-앱 동작
--------
-1. GitHub 저장소의 models/patch_anomaly 폴더에서 정상 특징 모델을 자동 검색
-2. 사용자가 검사 이미지를 드래그앤드롭
-3. Patch 기반 최근접 이웃 로직으로 이상 점수와 Heatmap 생성
-4. 좌측에 입력한 Gemini API 키로 선택 결과를 보조 해석
-5. 결과 이미지와 CSV를 ZIP으로 다운로드
-
-GitHub 권장 구조
----------------
+GitHub 구조
+-----------
 repository/
 ├── app.py
 ├── requirements.txt
 └── models/
     └── patch_anomaly/
-        ├── screw_memory.npy
-        └── screw_settings.json
-
-중요
-----
-- C:\\VisionAI 같은 사용자 PC 경로를 사용하지 않습니다.
-- Streamlit Cloud가 복제한 GitHub 저장소 내부 파일만 사용합니다.
-- Gemini 해석은 자동 검사 결과를 설명하는 보조 기능이며 최종 품질 판정을 대신하지 않습니다.
+        ├── screw_position_memory.npy
+        └── screw_position_settings.json
 """
 
 from __future__ import annotations
@@ -43,15 +29,10 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
-from sklearn.neighbors import NearestNeighbors
 
-
-# ============================================================
-# 1. Streamlit 화면 설정
-# ============================================================
 
 st.set_page_config(
-    page_title="Patch 이상 검사",
+    page_title="위치 기반 Patch 이상 검사",
     page_icon="🔬",
     layout="wide",
 )
@@ -59,59 +40,27 @@ st.set_page_config(
 APP_DIR = Path(__file__).resolve().parent
 MODEL_ROOT = APP_DIR / "models" / "patch_anomaly"
 
-st.title("🔬 Patch 기반 이상 검사")
+st.title("🔬 위치 기반 Patch 이상 검사")
 st.caption(
-    "GitHub에 저장된 정상 특징 모델로 업로드 이미지를 검사하고 Gemini로 결과를 해석합니다."
+    "검사 Patch를 동일 위치의 정상 Patch와 비교하여 이상 점수와 Heatmap을 생성합니다."
 )
 
 
-# ============================================================
-# 2. 업로드 영역 디자인
-# ============================================================
-
-st.markdown(
-    """
-    <style>
-    [data-testid="stFileUploaderDropzone"] {
-        min-height: 210px;
-        border: 2px dashed #5f7fff;
-        border-radius: 16px;
-        background-color: rgba(95, 127, 255, 0.06);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-
-    [data-testid="stFileUploaderDropzone"]:hover {
-        border-color: #315cff;
-        background-color: rgba(95, 127, 255, 0.12);
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# 3. GitHub 저장 모델 검색 및 불러오기
-# ============================================================
-
-def discover_memory_models(model_root: Path) -> list[dict[str, Path | str]]:
-    """
-    GitHub 저장소에서 *_memory.npy와 대응하는 *_settings.json을 찾습니다.
-
-    예:
-    screw_memory.npy
-    screw_settings.json
-    """
+def discover_models(model_root: Path) -> list[dict[str, Any]]:
     if not model_root.exists():
         return []
 
-    models: list[dict[str, Path | str]] = []
+    models: list[dict[str, Any]] = []
 
-    for memory_path in sorted(model_root.rglob("*_memory.npy")):
-        prefix = memory_path.name.removesuffix("_memory.npy")
-        settings_path = memory_path.with_name(f"{prefix}_settings.json")
+    for memory_path in sorted(
+        model_root.rglob("*_position_memory.npy")
+    ):
+        prefix = memory_path.name.removesuffix(
+            "_position_memory.npy"
+        )
+        settings_path = memory_path.with_name(
+            f"{prefix}_position_settings.json"
+        )
 
         if settings_path.exists():
             models.append(
@@ -126,69 +75,43 @@ def discover_memory_models(model_root: Path) -> list[dict[str, Path | str]]:
 
 
 @st.cache_resource(show_spinner=False)
-def load_memory_and_nearest(
+def load_model(
     memory_path_text: str,
     settings_path_text: str,
-    memory_modified_time: float,
-) -> tuple[np.ndarray, NearestNeighbors, dict[str, Any]]:
-    """
-    정상 특징 모델을 불러와 최근접 이웃 검색기를 구성합니다.
+    modified_time: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    del modified_time
 
-    memory_modified_time은 GitHub 모델 파일이 변경됐을 때
-    Streamlit 캐시가 자동으로 갱신되게 하기 위한 값입니다.
-    """
-    del memory_modified_time
-
-    memory_path = Path(memory_path_text)
-    settings_path = Path(settings_path_text)
-
-    memory = np.load(memory_path, allow_pickle=False)
-
-    if memory.ndim != 2 or memory.shape[1] != 3:
-        raise ValueError(
-            "정상 특징 파일 형식이 올바르지 않습니다. "
-            "예상 형식은 (전체 패치 수, 3)입니다."
-        )
+    memory = np.load(
+        memory_path_text,
+        allow_pickle=False,
+    )
 
     settings = json.loads(
-        settings_path.read_text(encoding="utf-8")
+        Path(settings_path_text).read_text(
+            encoding="utf-8"
+        )
     )
 
-    required_keys = {
-        "image_width",
-        "image_height",
-        "patch_size",
-        "canny_low",
-        "canny_high",
-    }
-
-    missing_keys = required_keys - set(settings)
-
-    if missing_keys:
+    if memory.ndim != 3 or memory.shape[2] != 3:
         raise ValueError(
-            "설정 파일에서 필요한 항목을 찾지 못했습니다: "
-            + ", ".join(sorted(missing_keys))
+            "현재 Memory 파일은 위치 기반 형식이 아닙니다. "
+            "새 모델 생성기로 다시 생성하세요. "
+            "예상 형식: (정상 이미지 수, Patch 수, 3)"
         )
 
-    nearest = NearestNeighbors(
-        n_neighbors=1,
-        algorithm="auto",
-        metric="euclidean",
-    )
-    nearest.fit(memory)
+    if settings.get("memory_type") != "position_based":
+        raise ValueError(
+            "설정 파일이 위치 기반 모델 형식이 아닙니다."
+        )
 
-    return memory, nearest, settings
+    return memory, settings
 
 
-# ============================================================
-# 4. 이미지 처리와 Patch 특징 추출
-# ============================================================
-
-def uploaded_image_to_gray(
+def uploaded_to_gray(
     uploaded_file: Any,
     image_size: tuple[int, int],
 ) -> np.ndarray:
-    """업로드 이미지를 지정된 크기의 0~1 흑백 영상으로 변환합니다."""
     file_bytes = np.asarray(
         bytearray(uploaded_file.getvalue()),
         dtype=np.uint8,
@@ -219,20 +142,6 @@ def patch_features(
     canny_low: int,
     canny_high: int,
 ) -> tuple[np.ndarray, list[tuple[int, int]]]:
-    """
-    각 패치에서 평균 밝기, 표준편차, 에지 비율을 추출합니다.
-    """
-    if patch_size <= 0:
-        raise ValueError("패치 크기는 1 이상이어야 합니다.")
-
-    if (
-        patch_size > image.shape[0]
-        or patch_size > image.shape[1]
-    ):
-        raise ValueError(
-            f"패치 크기 {patch_size}가 이미지 크기 {image.shape}보다 큽니다."
-        )
-
     features: list[list[float]] = []
     locations: list[tuple[int, int]] = []
 
@@ -251,10 +160,8 @@ def patch_features(
                 x:x + patch_size,
             ]
 
-            roi_uint8 = (roi * 255).astype(np.uint8)
-
             edges = cv2.Canny(
-                roi_uint8,
+                (roi * 255).astype(np.uint8),
                 canny_low,
                 canny_high,
             )
@@ -268,15 +175,34 @@ def patch_features(
             )
             locations.append((x, y))
 
-    return np.asarray(features, dtype=np.float32), locations
+    return np.asarray(
+        features,
+        dtype=np.float32,
+    ), locations
+
+
+def aggregate_image_score(
+    patch_scores: np.ndarray,
+    top_ratio: float,
+) -> float:
+    top_count = max(
+        1,
+        int(math.ceil(len(patch_scores) * top_ratio)),
+    )
+
+    top_scores = np.partition(
+        patch_scores,
+        -top_count,
+    )[-top_count:]
+
+    return float(top_scores.mean())
 
 
 def inspect_image(
     image: np.ndarray,
-    nearest: NearestNeighbors,
+    position_memory: np.ndarray,
     settings: dict[str, Any],
 ) -> dict[str, Any]:
-    """한 장의 이미지에서 이상 점수와 Heatmap을 계산합니다."""
     patch_size = int(settings["patch_size"])
 
     features, locations = patch_features(
@@ -286,8 +212,32 @@ def inspect_image(
         canny_high=int(settings["canny_high"]),
     )
 
-    distances, _ = nearest.kneighbors(features)
-    patch_scores = distances.ravel()
+    if features.shape[0] != position_memory.shape[1]:
+        raise ValueError(
+            "검사 이미지의 Patch 수와 모델의 Patch 수가 다릅니다."
+        )
+
+    # 동일 위치 Patch끼리만 비교
+    differences = (
+        position_memory
+        - features[np.newaxis, :, :]
+    )
+
+    distances = np.linalg.norm(
+        differences,
+        axis=2,
+    )
+
+    patch_scores = distances.min(axis=0)
+
+    top_ratio = float(
+        settings.get("top_ratio", 0.05)
+    )
+
+    image_score = aggregate_image_score(
+        patch_scores,
+        top_ratio,
+    )
 
     raw_heatmap = np.zeros_like(
         image,
@@ -303,7 +253,8 @@ def inspect_image(
             x:x + patch_size,
         ] = float(score)
 
-    normalized_heatmap = cv2.normalize(
+    # 화면 표시용 정규화이며 판정에는 raw 점수를 사용합니다.
+    display_heatmap = cv2.normalize(
         raw_heatmap,
         None,
         0,
@@ -311,16 +262,22 @@ def inspect_image(
         cv2.NORM_MINMAX,
     )
 
-    max_index = int(np.argmax(patch_scores))
+    max_index = int(
+        np.argmax(patch_scores)
+    )
     max_x, max_y = locations[max_index]
 
     return {
         "image": image,
-        "heatmap": normalized_heatmap,
-        "raw_heatmap": raw_heatmap,
+        "heatmap": display_heatmap,
         "patch_scores": patch_scores,
-        "max_score": float(patch_scores.max()),
-        "mean_score": float(patch_scores.mean()),
+        "image_score": image_score,
+        "max_patch_score": float(
+            patch_scores.max()
+        ),
+        "mean_patch_score": float(
+            patch_scores.mean()
+        ),
         "max_location": (
             max_x,
             max_y,
@@ -330,18 +287,25 @@ def inspect_image(
     }
 
 
-# ============================================================
-# 5. 결과 이미지 생성
-# ============================================================
+def gray_to_pil(image: np.ndarray) -> Image.Image:
+    image_uint8 = np.clip(
+        image * 255,
+        0,
+        255,
+    ).astype(np.uint8)
 
-def apply_heatmap(
-    gray_image: np.ndarray,
+    return Image.fromarray(
+        image_uint8
+    ).convert("RGB")
+
+
+def overlay_heatmap(
+    image: np.ndarray,
     heatmap: np.ndarray,
-    alpha: float = 0.50,
+    alpha: float,
 ) -> Image.Image:
-    """흑백 이미지 위에 Jet Heatmap을 겹칩니다."""
     gray_uint8 = np.clip(
-        gray_image * 255,
+        image * 255,
         0,
         255,
     ).astype(np.uint8)
@@ -362,7 +326,7 @@ def apply_heatmap(
         cv2.COLORMAP_JET,
     )
 
-    overlay_bgr = cv2.addWeighted(
+    overlay = cv2.addWeighted(
         gray_bgr,
         1.0 - alpha,
         heat_bgr,
@@ -370,61 +334,62 @@ def apply_heatmap(
         0,
     )
 
-    overlay_rgb = cv2.cvtColor(
-        overlay_bgr,
-        cv2.COLOR_BGR2RGB,
+    return Image.fromarray(
+        cv2.cvtColor(
+            overlay,
+            cv2.COLOR_BGR2RGB,
+        )
     )
 
-    return Image.fromarray(overlay_rgb)
 
-
-def gray_to_pil(gray_image: np.ndarray) -> Image.Image:
-    """0~1 흑백 배열을 PIL RGB 이미지로 변환합니다."""
-    gray_uint8 = np.clip(
-        gray_image * 255,
-        0,
-        255,
-    ).astype(np.uint8)
-
-    return Image.fromarray(gray_uint8).convert("RGB")
-
-
-def create_result_panel(
+def make_panel(
     original: Image.Image,
     overlay: Image.Image,
     filename: str,
-    max_score: float,
+    score: float,
     threshold: float,
     judgment: str,
 ) -> Image.Image:
-    """원본과 Heatmap 결과를 한 장으로 합칩니다."""
-    width = max(original.width, overlay.width)
-    image_height = max(original.height, overlay.height)
-    header_height = 60
+    width = max(
+        original.width,
+        overlay.width,
+    )
+    height = max(
+        original.height,
+        overlay.height,
+    )
+
+    header = 55
 
     panel = Image.new(
         "RGB",
-        (width * 2, image_height + header_height),
+        (width * 2, height + header),
         (245, 245, 245),
     )
 
-    panel.paste(original.resize((width, image_height)), (0, header_height))
-    panel.paste(overlay.resize((width, image_height)), (width, header_height))
+    panel.paste(
+        original.resize((width, height)),
+        (0, header),
+    )
+    panel.paste(
+        overlay.resize((width, height)),
+        (width, header),
+    )
 
     draw = ImageDraw.Draw(panel)
     font = ImageFont.load_default()
 
     draw.text(
-        (10, 8),
+        (8, 8),
         f"Original: {filename}",
         fill=(20, 20, 20),
         font=font,
     )
 
     draw.text(
-        (width + 10, 8),
+        (width + 8, 8),
         (
-            f"{judgment} | score={max_score:.6f} "
+            f"{judgment} | score={score:.6f} "
             f"| threshold={threshold:.6f}"
         ),
         fill=(20, 20, 20),
@@ -434,570 +399,326 @@ def create_result_panel(
     return panel
 
 
-def image_to_png_bytes(image: Image.Image) -> bytes:
+def image_bytes(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
 
 
-def create_contact_sheet(
-    records: list[dict[str, Any]],
-    columns: int = 3,
-) -> Image.Image:
-    """여러 검사 결과를 한 장의 격자 이미지로 합칩니다."""
-    if not records:
-        raise ValueError("모음 이미지로 만들 결과가 없습니다.")
-
-    columns = max(1, columns)
-    rows = math.ceil(len(records) / columns)
-
-    thumb_width = 520
-    thumb_height = 280
-    margin = 14
-    label_height = 36
-
-    cell_width = thumb_width + margin * 2
-    cell_height = thumb_height + label_height + margin * 2
-
-    sheet = Image.new(
-        "RGB",
-        (columns * cell_width, rows * cell_height),
-        (245, 245, 245),
-    )
-
-    draw = ImageDraw.Draw(sheet)
-    font = ImageFont.load_default()
-
-    for index, record in enumerate(records):
-        row = index // columns
-        column = index % columns
-
-        x0 = column * cell_width + margin
-        y0 = row * cell_height + margin
-
-        thumbnail = record["result_panel"].copy()
-        thumbnail.thumbnail((thumb_width, thumb_height))
-
-        paste_x = x0 + (thumb_width - thumbnail.width) // 2
-        paste_y = y0 + (thumb_height - thumbnail.height) // 2
-
-        sheet.paste(thumbnail, (paste_x, paste_y))
-
-        draw.text(
-            (x0, y0 + thumb_height + 8),
-            (
-                f"{index + 1}. {record['filename']} | "
-                f"{record['judgment']} | "
-                f"{record['max_score']:.4f}"
-            ),
-            fill=(20, 20, 20),
-            font=font,
-        )
-
-    return sheet
-
-
-# ============================================================
-# 6. Gemini 이미지 해석
-# ============================================================
-
 def analyze_with_gemini(
     api_key: str,
     model_name: str,
     record: dict[str, Any],
-    additional_request: str,
 ) -> str:
-    """
-    Gemini에 결과 이미지와 검사 수치를 전달하여 보조 해석을 생성합니다.
-    """
-    if not api_key.strip():
-        raise ValueError("Gemini API 키를 입력하세요.")
-
     client = genai.Client(
-        api_key=api_key.strip(),
+        api_key=api_key.strip()
     )
 
-    # 사용자가 models/gemini-... 형태로 입력해도 SDK 호출에는
-    # gemini-... 부분만 전달하도록 정리합니다.
-    normalized_model_name = model_name.strip()
+    normalized_name = model_name.strip()
 
-    if normalized_model_name.startswith("models/"):
-        normalized_model_name = normalized_model_name.removeprefix("models/")
-
-    result_png = image_to_png_bytes(
-        record["result_panel"]
-    )
+    if normalized_name.startswith("models/"):
+        normalized_name = normalized_name.removeprefix(
+            "models/"
+        )
 
     prompt = f"""
-당신은 반도체 및 정밀가공품의 비전 검사 결과를 검토하는 품질 엔지니어입니다.
-
-다음 Patch 기반 이상 탐지 결과를 해석하세요.
+당신은 비전 검사 결과를 검토하는 품질 엔지니어입니다.
 
 파일명: {record['filename']}
-알고리즘: 정상 이미지 Patch 특징 기반 최근접 이웃 이상 탐지
-특징: 평균 밝기, 밝기 표준편차, Canny 에지 비율
-최대 이상 점수: {record['max_score']:.6f}
-평균 이상 점수: {record['mean_score']:.6f}
-판정 임계값: {record['threshold']:.6f}
+검사 방식: 동일 위치 정상 Patch 비교
+이미지 점수: {record['image_score']:.6f}
+최대 Patch 점수: {record['max_patch_score']:.6f}
+평균 Patch 점수: {record['mean_patch_score']:.6f}
+임계값: {record['threshold']:.6f}
 자동 판정: {record['judgment']}
-최대 이상 영역 좌표(x1, y1, x2, y2): {record['max_location']}
+최대 이상 위치: {record['max_location']}
 
-아래 순서로 한국어로 설명하세요.
+원본과 Heatmap을 참고해 다음을 한국어로 설명하세요.
 
-1. 자동 판정 요약
-2. Heatmap에서 이상 반응이 집중된 위치
-3. 원본과 Heatmap을 함께 봤을 때 관찰되는 특징
+1. 판정 요약
+2. 이상 반응 위치
+3. 육안으로 보이는 특징
 4. 가능한 원인 가설
-5. 추가로 확인할 측정 또는 공정 항목
-6. 최종 판정 시 주의사항
+5. 추가 확인 항목
 
-중요:
-- 이미지와 점수만으로 실제 불량 종류나 원인을 확정하지 마세요.
-- 화면으로 확인할 수 없는 재료 특성이나 공정 조건을 사실처럼 단정하지 마세요.
-- Heatmap은 정상 특징과 다른 위치이지 반드시 실제 결함 위치라는 뜻은 아닙니다.
-
-사용자 추가 요청:
-{additional_request.strip() or "추가 요청 없음"}
+이미지와 점수만으로 원인을 확정하지 마세요.
 """
 
-    try:
-        response = client.models.generate_content(
-            model=normalized_model_name,
-            contents=[
-                prompt,
-                types.Part.from_bytes(
-                    data=result_png,
-                    mime_type="image/png",
+    response = client.models.generate_content(
+        model=normalized_name,
+        contents=[
+            prompt,
+            types.Part.from_bytes(
+                data=image_bytes(
+                    record["panel"]
                 ),
-            ],
-        )
+                mime_type="image/png",
+            ),
+        ],
+    )
 
-    except Exception as error:
-        error_text = str(error)
-
-        if "404" in error_text or "NOT_FOUND" in error_text:
-            raise RuntimeError(
-                "선택한 Gemini 모델을 현재 API 키에서 사용할 수 없습니다. "
-                "왼쪽 모델 선택에서 'gemini-flash-latest'를 선택하거나 "
-                "Google AI Studio에서 사용 가능한 모델명을 확인하세요.\n\n"
-                f"현재 요청 모델: {normalized_model_name}\n"
-                f"원본 오류: {error_text}"
-            ) from error
-
-        raise
-
-    if not response.text:
-        raise RuntimeError(
-            "Gemini에서 텍스트 응답을 받지 못했습니다."
-        )
-
-    return response.text
+    return response.text or "응답 텍스트가 없습니다."
 
 
-# ============================================================
-# 7. 결과 ZIP 생성
-# ============================================================
-
-def build_result_zip(
+def build_zip(
     records: list[dict[str, Any]],
 ) -> bytes:
-    """결과 이미지와 CSV를 ZIP으로 묶습니다."""
-    zip_buffer = io.BytesIO()
+    buffer = io.BytesIO()
 
     with zipfile.ZipFile(
-        zip_buffer,
-        mode="w",
-        compression=zipfile.ZIP_DEFLATED,
+        buffer,
+        "w",
+        zipfile.ZIP_DEFLATED,
     ) as zip_file:
-        csv_rows: list[dict[str, Any]] = []
+        rows = []
 
         for index, record in enumerate(
             records,
             start=1,
         ):
-            result_name = (
-                f"{index:03d}_"
-                f"{Path(record['filename']).stem}_result.png"
-            )
-
             zip_file.writestr(
-                result_name,
-                image_to_png_bytes(
-                    record["result_panel"]
+                (
+                    f"{index:03d}_"
+                    f"{Path(record['filename']).stem}_result.png"
                 ),
+                image_bytes(record["panel"]),
             )
 
-            csv_rows.append(
+            rows.append(
                 {
                     "파일명": record["filename"],
-                    "최대 이상 점수": record["max_score"],
-                    "평균 이상 점수": record["mean_score"],
+                    "이미지 점수": record["image_score"],
+                    "최대 Patch 점수": record["max_patch_score"],
+                    "평균 Patch 점수": record["mean_patch_score"],
                     "임계값": record["threshold"],
                     "판정": record["judgment"],
-                    "최대 이상 영역": record["max_location"],
+                    "최대 이상 위치": record["max_location"],
                 }
             )
 
-        dataframe = pd.DataFrame(csv_rows)
+        dataframe = pd.DataFrame(rows)
 
         zip_file.writestr(
             "anomaly_results.csv",
             dataframe.to_csv(
-                index=False,
+                index=False
             ).encode("utf-8-sig"),
         )
 
-        contact_sheet = create_contact_sheet(
-            records=records,
-            columns=3,
-        )
-
-        zip_file.writestr(
-            "prediction_contact_sheet.png",
-            image_to_png_bytes(contact_sheet),
-        )
-
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
-# ============================================================
-# 8. 세션 상태
-# ============================================================
+if "records" not in st.session_state:
+    st.session_state.records = []
 
-if "inspection_records" not in st.session_state:
-    st.session_state.inspection_records = []
-
-if "gemini_result" not in st.session_state:
-    st.session_state.gemini_result = None
+if "gemini_text" not in st.session_state:
+    st.session_state.gemini_text = None
 
 
-# ============================================================
-# 9. 사이드바
-# ============================================================
+models = discover_models(MODEL_ROOT)
 
-st.sidebar.header("모델 및 검사 설정")
+position_memory = None
+settings = None
 
-available_models = discover_memory_models(
-    MODEL_ROOT
-)
+st.sidebar.header("검사 모델")
 
-selected_model_info: dict[str, Any] | None = None
-memory: np.ndarray | None = None
-nearest: NearestNeighbors | None = None
-settings: dict[str, Any] | None = None
-
-if not available_models:
+if not models:
     st.sidebar.error(
-        "GitHub 저장소에서 정상 특징 모델을 찾지 못했습니다."
+        "위치 기반 모델 파일이 없습니다."
     )
     st.sidebar.code(
         "models/patch_anomaly/\n"
-        "├── screw_memory.npy\n"
-        "└── screw_settings.json"
+        "├── screw_position_memory.npy\n"
+        "└── screw_position_settings.json"
     )
-
-    st.error(
-        "GitHub 저장소의 models/patch_anomaly 폴더에 "
-        "정상 특징 모델 파일을 올려야 합니다."
-    )
-
 else:
-    model_names = [
-        str(model["name"])
-        for model in available_models
-    ]
-
-    selected_model_name = st.sidebar.selectbox(
-        "사용할 정상 특징 모델",
-        model_names,
+    selected_name = st.sidebar.selectbox(
+        "모델 선택",
+        [model["name"] for model in models],
     )
 
-    selected_model_info = next(
+    selected = next(
         model
-        for model in available_models
-        if model["name"] == selected_model_name
+        for model in models
+        if model["name"] == selected_name
     )
 
     try:
         memory_path = Path(
-            selected_model_info["memory_path"]
-        )
-        settings_path = Path(
-            selected_model_info["settings_path"]
+            selected["memory_path"]
         )
 
-        memory, nearest, settings = load_memory_and_nearest(
-            memory_path_text=str(memory_path),
-            settings_path_text=str(settings_path),
-            memory_modified_time=memory_path.stat().st_mtime,
+        position_memory, settings = load_model(
+            str(memory_path),
+            str(selected["settings_path"]),
+            memory_path.stat().st_mtime,
         )
 
         st.sidebar.success(
-            f"모델 준비 완료: {selected_model_name}"
-        )
-        st.sidebar.caption(
-            f"정상 특징 수: {memory.shape[0]:,}개"
+            f"{selected_name} 모델 준비 완료"
         )
 
         with st.sidebar.expander(
-            "모델 설정값 확인"
+            "정상 점수와 설정 확인"
         ):
             st.json(settings)
 
     except Exception as error:
         st.sidebar.exception(error)
 
+
+recommended_threshold = (
+    float(
+        settings.get(
+            "recommended_threshold",
+            0.20,
+        )
+    )
+    if settings
+    else 0.20
+)
+
 threshold = st.sidebar.number_input(
     "PASS/FAIL 임계값",
     min_value=0.0,
-    value=0.20,
-    step=0.01,
-    format="%.4f",
-    help=(
-        "정상과 불량 이미지 점수 분포를 비교하여 "
-        "검증한 임계값을 입력하세요."
+    value=recommended_threshold,
+    step=max(
+        recommended_threshold / 20,
+        0.001,
     ),
+    format="%.6f",
+)
+
+st.sidebar.caption(
+    f"모델 권장 임계값: {recommended_threshold:.6f}"
 )
 
 heatmap_alpha = st.sidebar.slider(
     "Heatmap 투명도",
-    min_value=0.10,
-    max_value=0.90,
-    value=0.50,
-    step=0.05,
+    0.10,
+    0.90,
+    0.50,
+    0.05,
 )
 
 st.sidebar.divider()
-st.sidebar.header("Gemini 결과 해석")
+st.sidebar.header("Gemini 해석")
 
-gemini_api_key = st.sidebar.text_input(
+gemini_key = st.sidebar.text_input(
     "Gemini API 키",
     type="password",
-    help=(
-        "현재 세션에서만 사용하며 코드나 GitHub 저장소에는 저장하지 않습니다."
-    ),
 )
 
-gemini_model_choice = st.sidebar.selectbox(
-    "Gemini 모델",
-    [
-        "gemini-flash-latest",
-        "gemini-3.5-flash",
-        "직접 입력",
-    ],
-    index=0,
-    help=(
-        "gemini-flash-latest는 현재 Flash 계열 최신 모델을 가리키는 별칭입니다. "
-        "특정 버전을 고정하려면 gemini-3.5-flash 또는 직접 입력을 사용하세요."
-    ),
+gemini_model = st.sidebar.text_input(
+    "Gemini 모델명",
+    value="gemini-flash-latest",
 )
 
-if gemini_model_choice == "직접 입력":
-    gemini_model = st.sidebar.text_input(
-        "직접 입력할 Gemini 모델명",
-        value="gemini-flash-latest",
-        help=(
-            "예: gemini-flash-latest 또는 Gemini API에서 현재 사용 가능한 모델명"
-        ),
-    )
-else:
-    gemini_model = gemini_model_choice
-
-additional_request = st.sidebar.text_area(
-    "추가 분석 요청",
-    value=(
-        "Heatmap과 이상 점수를 품질팀 관점에서 해석하고 "
-        "추가 확인 항목을 알려주세요."
-    ),
-)
-
-
-# ============================================================
-# 10. 검사 이미지 업로드
-# ============================================================
-
-st.subheader("1. 검사 이미지 등록")
 
 uploaded_files = st.file_uploader(
-    "이미지 파일을 이곳에 드래그앤드롭하세요.",
+    "검사 이미지를 드래그앤드롭하세요.",
     type=["png", "jpg", "jpeg", "bmp", "webp"],
     accept_multiple_files=True,
-    help="한 장 또는 여러 장을 동시에 등록할 수 있습니다.",
 )
 
-if uploaded_files:
-    st.success(
-        f"{len(uploaded_files)}장의 이미지를 등록했습니다."
-    )
-
-    preview_columns = st.columns(
-        min(4, len(uploaded_files))
-    )
-
-    for index, uploaded_file in enumerate(
-        uploaded_files[:4]
-    ):
-        with preview_columns[index]:
-            st.image(
-                uploaded_file,
-                caption=uploaded_file.name,
-                use_container_width=True,
-            )
-
-
-# ============================================================
-# 11. 검사 실행
-# ============================================================
-
-st.subheader("2. 코드 로직으로 이상 검사")
-
-inspection_disabled = (
+disabled = (
     not uploaded_files
-    or nearest is None
+    or position_memory is None
     or settings is None
 )
 
 if st.button(
     "이미지 검사 시작",
     type="primary",
-    disabled=inspection_disabled,
+    disabled=disabled,
     use_container_width=True,
 ):
     try:
-        records: list[dict[str, Any]] = []
+        records = []
 
-        progress = st.progress(
-            0,
-            text="검사 이미지를 처리하고 있습니다.",
-        )
-
-        image_size = (
-            int(settings["image_width"]),
-            int(settings["image_height"]),
-        )
-
-        for index, uploaded_file in enumerate(
-            uploaded_files,
-            start=1,
-        ):
-            gray_image = uploaded_image_to_gray(
-                uploaded_file=uploaded_file,
-                image_size=image_size,
+        for uploaded_file in uploaded_files:
+            gray = uploaded_to_gray(
+                uploaded_file,
+                (
+                    int(settings["image_width"]),
+                    int(settings["image_height"]),
+                ),
             )
 
             result = inspect_image(
-                image=gray_image,
-                nearest=nearest,
-                settings=settings,
+                gray,
+                position_memory,
+                settings,
             )
 
             judgment = (
                 "FAIL"
-                if result["max_score"] >= float(threshold)
+                if result["image_score"] >= threshold
                 else "PASS"
             )
 
-            original_pil = gray_to_pil(
+            original = gray_to_pil(
                 result["image"]
             )
-
-            overlay_pil = apply_heatmap(
-                gray_image=result["image"],
-                heatmap=result["heatmap"],
-                alpha=float(heatmap_alpha),
+            overlay = overlay_heatmap(
+                result["image"],
+                result["heatmap"],
+                heatmap_alpha,
             )
 
-            result_panel = create_result_panel(
-                original=original_pil,
-                overlay=overlay_pil,
-                filename=uploaded_file.name,
-                max_score=result["max_score"],
-                threshold=float(threshold),
-                judgment=judgment,
+            panel = make_panel(
+                original,
+                overlay,
+                uploaded_file.name,
+                result["image_score"],
+                threshold,
+                judgment,
             )
 
             records.append(
                 {
                     "filename": uploaded_file.name,
-                    "max_score": result["max_score"],
-                    "mean_score": result["mean_score"],
+                    "image_score": result["image_score"],
+                    "max_patch_score": result["max_patch_score"],
+                    "mean_patch_score": result["mean_patch_score"],
                     "max_location": result["max_location"],
-                    "threshold": float(threshold),
+                    "threshold": threshold,
                     "judgment": judgment,
-                    "result_panel": result_panel,
+                    "panel": panel,
                 }
             )
 
-            progress.progress(
-                index / len(uploaded_files),
-                text=(
-                    f"검사 중 {index}/{len(uploaded_files)}: "
-                    f"{uploaded_file.name}"
-                ),
-            )
-
-        st.session_state.inspection_records = records
-        st.session_state.gemini_result = None
-
-        st.success("전체 이미지 검사가 완료되었습니다.")
+        st.session_state.records = records
+        st.session_state.gemini_text = None
 
     except Exception as error:
         st.exception(error)
 
 
-# ============================================================
-# 12. 검사 결과
-# ============================================================
-
-records = st.session_state.inspection_records
+records = st.session_state.records
 
 if records:
-    st.divider()
-    st.subheader("3. 검사 결과")
-
     dataframe = pd.DataFrame(
         [
             {
                 "파일명": record["filename"],
-                "최대 이상 점수": round(
-                    record["max_score"],
+                "이미지 점수": round(
+                    record["image_score"],
                     6,
                 ),
-                "평균 이상 점수": round(
-                    record["mean_score"],
+                "최대 Patch 점수": round(
+                    record["max_patch_score"],
                     6,
                 ),
-                "임계값": record["threshold"],
+                "임계값": round(
+                    record["threshold"],
+                    6,
+                ),
                 "판정": record["judgment"],
-                "최대 이상 영역": str(
-                    record["max_location"]
-                ),
             }
             for record in records
         ]
-    )
-
-    pass_count = int(
-        (dataframe["판정"] == "PASS").sum()
-    )
-    fail_count = int(
-        (dataframe["판정"] == "FAIL").sum()
-    )
-
-    metric1, metric2, metric3 = st.columns(3)
-
-    metric1.metric(
-        "검사 이미지",
-        len(records),
-    )
-    metric2.metric(
-        "PASS",
-        pass_count,
-    )
-    metric3.metric(
-        "FAIL",
-        fail_count,
     )
 
     st.dataframe(
@@ -1007,11 +728,8 @@ if records:
     )
 
     selected_filename = st.selectbox(
-        "상세 확인 이미지",
-        [
-            record["filename"]
-            for record in records
-        ],
+        "상세 결과",
+        [record["filename"] for record in records],
     )
 
     selected_record = next(
@@ -1021,106 +739,36 @@ if records:
     )
 
     st.image(
-        selected_record["result_panel"],
-        caption=(
-            f"{selected_record['filename']} | "
-            f"{selected_record['judgment']} | "
-            f"Score={selected_record['max_score']:.6f}"
-        ),
+        selected_record["panel"],
         use_container_width=True,
-    )
-
-    st.markdown("### 전체 결과 모음")
-
-    contact_columns = st.slider(
-        "한 줄에 표시할 결과 수",
-        min_value=1,
-        max_value=5,
-        value=3,
-        step=1,
-    )
-
-    contact_sheet = create_contact_sheet(
-        records=records,
-        columns=contact_columns,
-    )
-
-    st.image(
-        contact_sheet,
-        caption="전체 검사 결과",
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# 13. Gemini 해석
-# ============================================================
-
-if records:
-    st.divider()
-    st.subheader("4. Gemini API 결과 해석")
-
-    st.info(
-        "좌측에 Gemini API 키를 입력한 후 아래 버튼을 누르세요. "
-        "Gemini는 코드 로직의 결과 이미지와 점수를 보조 해석합니다."
     )
 
     if st.button(
-        "선택 결과를 Gemini로 해석",
-        type="primary",
-        disabled=not gemini_api_key.strip(),
+        "선택 결과 Gemini 해석",
+        disabled=not gemini_key.strip(),
         use_container_width=True,
     ):
         try:
             with st.spinner(
-                "Gemini가 검사 결과를 해석하고 있습니다."
+                "Gemini가 결과를 해석하고 있습니다."
             ):
-                gemini_text = analyze_with_gemini(
-                    api_key=gemini_api_key,
-                    model_name=gemini_model.strip(),
-                    record=selected_record,
-                    additional_request=additional_request,
+                st.session_state.gemini_text = analyze_with_gemini(
+                    gemini_key,
+                    gemini_model,
+                    selected_record,
                 )
-
-            st.session_state.gemini_result = {
-                "filename": selected_record["filename"],
-                "text": gemini_text,
-            }
-
         except Exception as error:
             st.exception(error)
 
-    gemini_result = st.session_state.gemini_result
-
-    if gemini_result:
-        st.success(
-            f"Gemini 해석 완료: {gemini_result['filename']}"
-        )
+    if st.session_state.gemini_text:
         st.markdown(
-            gemini_result["text"]
+            st.session_state.gemini_text
         )
-
-
-# ============================================================
-# 14. 결과 다운로드
-# ============================================================
-
-if records:
-    st.divider()
-    st.subheader("5. 결과 다운로드")
-
-    result_zip = build_result_zip(
-        records=records
-    )
 
     st.download_button(
-        "전체 검사 결과 ZIP 다운로드",
-        data=result_zip,
-        file_name="patch_anomaly_results.zip",
+        "검사 결과 ZIP 다운로드",
+        data=build_zip(records),
+        file_name="position_patch_results.zip",
         mime="application/zip",
         use_container_width=True,
-    )
-
-    st.caption(
-        "ZIP에는 개별 결과 이미지, 전체 모음 이미지, 검사 결과 CSV가 포함됩니다."
     )

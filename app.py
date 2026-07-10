@@ -446,6 +446,208 @@ YOLO 검출 결과:
     return response.text
 
 
+def analyze_all_yolo_results_with_gemini(
+    api_key: str,
+    model_name: str,
+    original_images: list[Image.Image],
+    annotated_images: list[Image.Image],
+    filenames: list[str],
+    detection_rows: list[dict[str, Any]],
+    confidence_threshold: float,
+    user_request: str,
+) -> str:
+    """
+    전체 검사 이미지와 전체 검출 데이터를 Gemini에 전달하여
+    데이터셋 전체 기준의 종합 분석을 생성합니다.
+
+    이미지가 너무 많으면 API 입력 부담을 줄이기 위해
+    최대 12장까지 대표 이미지를 전달하고,
+    모든 이미지의 검출 수치는 표 형태로 함께 전달합니다.
+    """
+    if not api_key.strip():
+        raise ValueError("Gemini API 키를 입력하세요.")
+
+    normalized_model = normalize_gemini_model_name(model_name)
+
+    if not normalized_model:
+        raise ValueError("Gemini 모델명을 입력하세요.")
+
+    client = genai.Client(api_key=api_key.strip())
+
+    # 전체 파일별 검출 요약 생성
+    file_summaries = []
+
+    for filename in filenames:
+        rows = [
+            row
+            for row in detection_rows
+            if row.get("파일명") == filename
+        ]
+
+        valid_rows = [
+            row
+            for row in rows
+            if row.get("클래스") != "검출 없음"
+        ]
+
+        confidences = [
+            float(row["신뢰도"])
+            for row in valid_rows
+            if isinstance(row.get("신뢰도"), (int, float))
+        ]
+
+        file_summaries.append(
+            {
+                "파일명": filename,
+                "검출 수": len(valid_rows),
+                "검출 클래스": [
+                    row.get("클래스")
+                    for row in valid_rows
+                ],
+                "최대 신뢰도": (
+                    round(max(confidences), 4)
+                    if confidences
+                    else None
+                ),
+                "평균 신뢰도": (
+                    round(sum(confidences) / len(confidences), 4)
+                    if confidences
+                    else None
+                ),
+            }
+        )
+
+    total_detected_images = sum(
+        1
+        for summary in file_summaries
+        if summary["검출 수"] > 0
+    )
+
+    total_boxes = sum(
+        summary["검출 수"]
+        for summary in file_summaries
+    )
+
+    class_counts: dict[str, int] = {}
+
+    for row in detection_rows:
+        class_name = row.get("클래스")
+
+        if class_name and class_name != "검출 없음":
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+
+    prompt = f"""
+당신은 반도체 및 정밀가공품의 비전검사 결과를 검토하는 품질 엔지니어입니다.
+
+이번 요청은 개별 이미지 1장이 아니라 전체 검사 데이터 기준의 종합 분석입니다.
+
+전체 검사 이미지 수: {len(filenames)}
+검출이 발생한 이미지 수: {total_detected_images}
+전체 검출 박스 수: {total_boxes}
+YOLO 신뢰도 기준: {confidence_threshold:.2f}
+클래스별 검출 수: {class_counts}
+
+파일별 검사 요약:
+{file_summaries}
+
+전체 검출 상세 데이터:
+{detection_rows}
+
+반드시 다음 순서로 한국어로 분석하세요.
+
+1. 전체 검사 결과 요약
+2. 검출 빈도가 높은 클래스와 이미지 유형
+3. 신뢰도가 높은 검출과 낮은 검출의 분포
+4. 반복적으로 나타나는 위치 또는 형상 경향
+5. 오검출 가능성이 높은 사례
+6. 추가로 확인할 측정·공정 항목
+7. 모델 개선을 위한 데이터 수집 및 재학습 제안
+8. 최종 품질 판단 시 주의사항
+
+중요:
+- 검출이 없는 이미지를 정상 확정이라고 표현하지 마세요.
+- YOLO 검출 결과와 Gemini의 이미지 해석을 최종 품질 판정으로 단정하지 마세요.
+- 전체 데이터에서 반복되는 경향과 예외 사례를 구분해 설명하세요.
+- 이미지에서 보이지 않는 재료, 치수, 공정 조건은 사실처럼 단정하지 마세요.
+
+사용자 추가 요청:
+{user_request.strip() or "추가 요청 없음"}
+"""
+
+    # 전체 이미지를 모두 보내면 입력 크기가 지나치게 커질 수 있으므로
+    # 최대 12장의 대표 이미지를 균등 간격으로 선택합니다.
+    max_images_for_ai = 12
+
+    if len(filenames) <= max_images_for_ai:
+        selected_indices = list(range(len(filenames)))
+    else:
+        selected_indices = sorted(
+            {
+                round(
+                    index * (len(filenames) - 1)
+                    / (max_images_for_ai - 1)
+                )
+                for index in range(max_images_for_ai)
+            }
+        )
+
+    contents: list[Any] = [prompt]
+
+    for index in selected_indices:
+        contents.append(
+            f"대표 이미지 {index + 1}: {filenames[index]} - 원본"
+        )
+        contents.append(
+            types.Part.from_bytes(
+                data=image_to_jpeg_bytes(
+                    original_images[index],
+                    quality=88,
+                ),
+                mime_type="image/jpeg",
+            )
+        )
+
+        contents.append(
+            f"대표 이미지 {index + 1}: {filenames[index]} - YOLO 결과"
+        )
+        contents.append(
+            types.Part.from_bytes(
+                data=image_to_jpeg_bytes(
+                    annotated_images[index],
+                    quality=88,
+                ),
+                mime_type="image/jpeg",
+            )
+        )
+
+    try:
+        response = client.models.generate_content(
+            model=normalized_model,
+            contents=contents,
+        )
+
+    except Exception as error:
+        error_text = str(error)
+
+        if "404" in error_text or "NOT_FOUND" in error_text:
+            raise RuntimeError(
+                "선택한 Gemini 모델을 현재 API 키에서 사용할 수 없습니다. "
+                "왼쪽 모델 입력을 'gemini-3.1-flash-lite'로 변경하거나 "
+                "Google AI Studio에서 사용 가능한 모델명을 확인하세요.\n\n"
+                f"현재 요청 모델: {normalized_model}\n"
+                f"원본 오류: {error_text}"
+            ) from error
+
+        raise
+
+    if not response.text:
+        raise RuntimeError(
+            "Gemini에서 전체 데이터 분석 텍스트를 받지 못했습니다."
+        )
+
+    return response.text
+
+
 def build_result_zip(
     annotated_images: list[Image.Image],
     filenames: list[str],
@@ -855,85 +1057,179 @@ if saved_results:
     with result_tabs[3]:
         st.markdown("### Gemini API 검사 결과 분석")
 
-        st.info(
-            "원본 이미지, YOLO 검출 표시 이미지, 클래스·신뢰도·좌표를 함께 전달하여 "
-            "품질검사 관점의 보조 분석을 생성합니다."
+        analysis_mode = st.radio(
+            "분석 범위",
+            [
+                "개별 이미지 기준",
+                "전체 데이터 기준",
+            ],
+            horizontal=True,
         )
 
-        gemini_target_index = st.selectbox(
-            "Gemini로 분석할 이미지",
-            options=list(range(len(result_filenames))),
-            format_func=lambda index: (
-                f"{index + 1}. {result_filenames[index]}"
-            ),
-            key="gemini_target_index",
-        )
-
-        gemini_col1, gemini_col2 = st.columns(2)
-
-        with gemini_col1:
-            st.image(
-                original_images[gemini_target_index],
-                caption="원본 이미지",
-                use_container_width=True,
+        if analysis_mode == "개별 이미지 기준":
+            st.info(
+                "선택한 이미지 1장의 원본, YOLO 검출 결과, 클래스·신뢰도·좌표를 "
+                "Gemini에 전달해 보조 분석을 생성합니다."
             )
 
-        with gemini_col2:
-            st.image(
-                annotated_images[gemini_target_index],
-                caption="YOLO 검출 결과",
-                use_container_width=True,
+            gemini_target_index = st.selectbox(
+                "Gemini로 분석할 이미지",
+                options=list(range(len(result_filenames))),
+                format_func=lambda index: (
+                    f"{index + 1}. {result_filenames[index]}"
+                ),
+                key="gemini_target_index",
             )
 
-        current_filename = result_filenames[gemini_target_index]
+            gemini_col1, gemini_col2 = st.columns(2)
 
-        current_rows = [
-            row
-            for row in detection_rows
-            if row["파일명"] == current_filename
-        ]
+            with gemini_col1:
+                st.image(
+                    original_images[gemini_target_index],
+                    caption="원본 이미지",
+                    use_container_width=True,
+                )
 
-        st.dataframe(
-            pd.DataFrame(current_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
+            with gemini_col2:
+                st.image(
+                    annotated_images[gemini_target_index],
+                    caption="YOLO 검출 결과",
+                    use_container_width=True,
+                )
 
-        if st.button(
-            "선택한 결과를 Gemini로 분석",
-            type="primary",
-            disabled=not gemini_api_key.strip(),
-            use_container_width=True,
-        ):
-            try:
-                with st.spinner(
-                    "Gemini가 원본 이미지와 YOLO 검사 결과를 분석하고 있습니다."
-                ):
-                    analysis_text = analyze_yolo_result_with_gemini(
-                        api_key=gemini_api_key,
-                        model_name=gemini_model_name,
-                        original_image=original_images[gemini_target_index],
-                        annotated_image=annotated_images[gemini_target_index],
-                        filename=current_filename,
-                        detection_rows=detection_rows,
-                        confidence_threshold=float(
-                            saved_results.get(
-                                "confidence_threshold",
-                                confidence,
-                            )
-                        ),
-                        user_request=gemini_user_request,
-                    )
+            current_filename = result_filenames[gemini_target_index]
 
-                st.session_state["gemini_analysis"] = {
-                    "filename": current_filename,
-                    "text": analysis_text,
+            current_rows = [
+                row
+                for row in detection_rows
+                if row["파일명"] == current_filename
+            ]
+
+            st.dataframe(
+                pd.DataFrame(current_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if st.button(
+                "선택한 결과를 Gemini로 분석",
+                type="primary",
+                disabled=not gemini_api_key.strip(),
+                use_container_width=True,
+            ):
+                try:
+                    with st.spinner(
+                        "Gemini가 선택 이미지와 YOLO 검사 결과를 분석하고 있습니다."
+                    ):
+                        analysis_text = analyze_yolo_result_with_gemini(
+                            api_key=gemini_api_key,
+                            model_name=gemini_model_name,
+                            original_image=original_images[gemini_target_index],
+                            annotated_image=annotated_images[gemini_target_index],
+                            filename=current_filename,
+                            detection_rows=detection_rows,
+                            confidence_threshold=float(
+                                saved_results.get(
+                                    "confidence_threshold",
+                                    confidence,
+                                )
+                            ),
+                            user_request=gemini_user_request,
+                        )
+
+                    st.session_state["gemini_analysis"] = {
+                        "mode": "개별 이미지",
+                        "filename": current_filename,
+                        "text": analysis_text,
+                    }
+
+                    st.success("Gemini 개별 분석이 완료되었습니다.")
+
+                except Exception as error:
+                    st.exception(error)
+
+        else:
+            st.info(
+                "전체 이미지의 검출 수, 클래스, 신뢰도, 좌표를 모두 전달하고, "
+                "대표 원본·결과 이미지를 함께 보내 전체 경향을 분석합니다."
+            )
+
+            total_detected_images = len(
+                {
+                    row["파일명"]
+                    for row in detection_rows
+                    if row["클래스"] != "검출 없음"
                 }
+            )
 
-                st.success("Gemini 분석이 완료되었습니다.")
+            total_boxes = sum(
+                1
+                for row in detection_rows
+                if row["클래스"] != "검출 없음"
+            )
 
-            except Exception as error:
-                st.exception(error)
+            all_col1, all_col2, all_col3 = st.columns(3)
+
+            all_col1.metric(
+                "전체 이미지",
+                len(result_filenames),
+            )
+            all_col2.metric(
+                "검출 이미지",
+                total_detected_images,
+            )
+            all_col3.metric(
+                "전체 박스",
+                total_boxes,
+            )
+
+            st.dataframe(
+                pd.DataFrame(detection_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(
+                "이미지가 12장을 초과하면 전체 수치 데이터는 모두 전달하고, "
+                "대표 이미지는 최대 12장을 균등하게 선택해 Gemini에 전달합니다."
+            )
+
+            if st.button(
+                "전체 데이터를 Gemini로 종합 분석",
+                type="primary",
+                disabled=not gemini_api_key.strip(),
+                use_container_width=True,
+            ):
+                try:
+                    with st.spinner(
+                        "Gemini가 전체 검사 데이터와 대표 이미지를 종합 분석하고 있습니다."
+                    ):
+                        analysis_text = analyze_all_yolo_results_with_gemini(
+                            api_key=gemini_api_key,
+                            model_name=gemini_model_name,
+                            original_images=original_images,
+                            annotated_images=annotated_images,
+                            filenames=result_filenames,
+                            detection_rows=detection_rows,
+                            confidence_threshold=float(
+                                saved_results.get(
+                                    "confidence_threshold",
+                                    confidence,
+                                )
+                            ),
+                            user_request=gemini_user_request,
+                        )
+
+                    st.session_state["gemini_analysis"] = {
+                        "mode": "전체 데이터",
+                        "filename": "전체 검사 데이터",
+                        "text": analysis_text,
+                    }
+
+                    st.success("Gemini 전체 데이터 분석이 완료되었습니다.")
+
+                except Exception as error:
+                    st.exception(error)
 
         gemini_analysis = st.session_state.get(
             "gemini_analysis"
@@ -941,7 +1237,10 @@ if saved_results:
 
         if gemini_analysis:
             st.markdown(
-                f"#### 분석 대상: {gemini_analysis['filename']}"
+                f"#### 분석 범위: {gemini_analysis.get('mode', '분석')}"
+            )
+            st.markdown(
+                f"**분석 대상:** {gemini_analysis['filename']}"
             )
             st.markdown(gemini_analysis["text"])
 
@@ -1008,7 +1307,8 @@ with st.expander("GitHub 모델 연결 방법"):
         ### Gemini 분석
 
         왼쪽 사이드바에 Gemini API 키와 모델명을 입력하면,
-        원본 이미지와 YOLO 검출 결과를 함께 분석할 수 있습니다.
+        개별 이미지 또는 전체 검사 데이터 기준으로 원본 이미지와
+        YOLO 검출 결과를 함께 분석할 수 있습니다.
 
         기본 모델명:
 

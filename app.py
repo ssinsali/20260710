@@ -430,7 +430,7 @@ YOLO 검출 결과:
         if "404" in error_text or "NOT_FOUND" in error_text:
             raise RuntimeError(
                 "선택한 Gemini 모델을 현재 API 키에서 사용할 수 없습니다. "
-                "왼쪽 모델 입력을 'gemini-flash-latest'로 변경하거나 "
+                "왼쪽 모델 입력을 'gemini-3.1-flash-lite'로 변경하거나 "
                 "Google AI Studio에서 사용 가능한 모델명을 확인하세요.\n\n"
                 f"현재 요청 모델: {normalized_model}\n"
                 f"원본 오류: {error_text}"
@@ -615,9 +615,9 @@ gemini_api_key = st.sidebar.text_input(
 
 gemini_model_name = st.sidebar.text_input(
     "Gemini 모델명",
-    value="gemini-flash-latest",
+    value="gemini-3.1-flash-lite",
     help=(
-        "현재 API 키에서 사용할 수 있는 이미지 입력 지원 모델명을 입력하세요."
+        "Gemini 3.1 Flash-Lite의 API 모델명은 gemini-3.1-flash-lite 입니다."
     ),
 )
 
@@ -1013,7 +1013,7 @@ with st.expander("GitHub 모델 연결 방법"):
         기본 모델명:
 
         ```text
-        gemini-flash-latest
+        gemini-3.1-flash-lite
         ```
 
         API 키는 현재 실행 세션에서만 사용되며 GitHub에 저장되지 않습니다.
@@ -1026,4 +1026,3 @@ with st.expander("GitHub 모델 연결 방법"):
 
         Gemini의 설명은 보조 분석이며 최종 품질 판정을 대신하지 않습니다.
         """
-    )

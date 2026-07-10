@@ -517,6 +517,13 @@ def analyze_with_gemini(
         api_key=api_key.strip(),
     )
 
+    # 사용자가 models/gemini-... 형태로 입력해도 SDK 호출에는
+    # gemini-... 부분만 전달하도록 정리합니다.
+    normalized_model_name = model_name.strip()
+
+    if normalized_model_name.startswith("models/"):
+        normalized_model_name = normalized_model_name.removeprefix("models/")
+
     result_png = image_to_png_bytes(
         record["result_panel"]
     )
@@ -553,16 +560,31 @@ def analyze_with_gemini(
 {additional_request.strip() or "추가 요청 없음"}
 """
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            prompt,
-            types.Part.from_bytes(
-                data=result_png,
-                mime_type="image/png",
-            ),
-        ],
-    )
+    try:
+        response = client.models.generate_content(
+            model=normalized_model_name,
+            contents=[
+                prompt,
+                types.Part.from_bytes(
+                    data=result_png,
+                    mime_type="image/png",
+                ),
+            ],
+        )
+
+    except Exception as error:
+        error_text = str(error)
+
+        if "404" in error_text or "NOT_FOUND" in error_text:
+            raise RuntimeError(
+                "선택한 Gemini 모델을 현재 API 키에서 사용할 수 없습니다. "
+                "왼쪽 모델 선택에서 'gemini-flash-latest'를 선택하거나 "
+                "Google AI Studio에서 사용 가능한 모델명을 확인하세요.\n\n"
+                f"현재 요청 모델: {normalized_model_name}\n"
+                f"원본 오류: {error_text}"
+            ) from error
+
+        raise
 
     if not response.text:
         raise RuntimeError(
@@ -757,11 +779,30 @@ gemini_api_key = st.sidebar.text_input(
     ),
 )
 
-gemini_model = st.sidebar.text_input(
+gemini_model_choice = st.sidebar.selectbox(
     "Gemini 모델",
-    value="gemini-2.5-flash",
-    help="이미지 입력을 지원하는 Gemini 모델명을 입력하세요.",
+    [
+        "gemini-flash-latest",
+        "gemini-3.5-flash",
+        "직접 입력",
+    ],
+    index=0,
+    help=(
+        "gemini-flash-latest는 현재 Flash 계열 최신 모델을 가리키는 별칭입니다. "
+        "특정 버전을 고정하려면 gemini-3.5-flash 또는 직접 입력을 사용하세요."
+    ),
 )
+
+if gemini_model_choice == "직접 입력":
+    gemini_model = st.sidebar.text_input(
+        "직접 입력할 Gemini 모델명",
+        value="gemini-flash-latest",
+        help=(
+            "예: gemini-flash-latest 또는 Gemini API에서 현재 사용 가능한 모델명"
+        ),
+    )
+else:
+    gemini_model = gemini_model_choice
 
 additional_request = st.sidebar.text_area(
     "추가 분석 요청",

@@ -1,9 +1,0 @@
-{
-    "category_name": "screw",
-    "image_width": 128,
-    "image_height": 128,
-    "patch_size": 16,
-    "canny_low": 40,
-    "canny_high": 120,
-    "normal_image_count": 80
-}

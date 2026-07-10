@@ -1,9 +1,0 @@
-streamlit
-ultralytics
-torch
-torchvision
-numpy
-pandas
-Pillow
-requests
-opencv-python-headless

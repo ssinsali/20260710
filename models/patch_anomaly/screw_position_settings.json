@@ -1,0 +1,20 @@
+{
+  "category_name": "screw",
+  "image_width": 128,
+  "image_height": 128,
+  "patch_size": 16,
+  "canny_low": 40,
+  "canny_high": 120,
+  "normal_image_count": 80,
+  "patch_count": 64,
+  "feature_count": 3,
+  "memory_type": "position_based",
+  "score_method": "top_ratio_mean",
+  "top_ratio": 0.05,
+  "threshold_percentile": 99.0,
+  "recommended_threshold": 0.08195391856133938,
+  "normal_score_min": 0.022404665127396584,
+  "normal_score_mean": 0.044835519045591354,
+  "normal_score_std": 0.0139522235840559,
+  "normal_score_max": 0.08467479050159454
+}

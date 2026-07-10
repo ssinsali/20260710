@@ -12,3 +12,4 @@ scikit-learn
 joblib
 Pillow
 openai
+google-genai

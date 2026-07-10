@@ -32,6 +32,8 @@ import streamlit as st
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
+from google import genai
+from google.genai import types
 
 
 # ============================================================
@@ -309,6 +311,141 @@ def image_to_jpeg_bytes(image: Image.Image, quality: int = 95) -> bytes:
     return buffer.getvalue()
 
 
+def normalize_gemini_model_name(model_name: str) -> str:
+    """
+    models/gemini-... 형태로 입력해도 SDK에서 사용할 수 있도록 정리합니다.
+    """
+    normalized = model_name.strip()
+
+    if normalized.startswith("models/"):
+        normalized = normalized.removeprefix("models/")
+
+    return normalized
+
+
+def analyze_yolo_result_with_gemini(
+    api_key: str,
+    model_name: str,
+    original_image: Image.Image,
+    annotated_image: Image.Image,
+    filename: str,
+    detection_rows: list[dict[str, Any]],
+    confidence_threshold: float,
+    user_request: str,
+) -> str:
+    """
+    원본 이미지, YOLO 표시 이미지, 검출 수치를 Gemini에 전달하여
+    품질검사 관점의 보조 해석을 생성합니다.
+    """
+    if not api_key.strip():
+        raise ValueError("Gemini API 키를 입력하세요.")
+
+    normalized_model = normalize_gemini_model_name(model_name)
+
+    if not normalized_model:
+        raise ValueError("Gemini 모델명을 입력하세요.")
+
+    client = genai.Client(api_key=api_key.strip())
+
+    detected_rows = [
+        row
+        for row in detection_rows
+        if row.get("파일명") == filename
+    ]
+
+    detection_summary = []
+
+    for row in detected_rows:
+        detection_summary.append(
+            {
+                "검출 번호": row.get("검출 번호"),
+                "클래스": row.get("클래스"),
+                "신뢰도": row.get("신뢰도"),
+                "좌표": [
+                    row.get("x1"),
+                    row.get("y1"),
+                    row.get("x2"),
+                    row.get("y2"),
+                ],
+            }
+        )
+
+    prompt = f"""
+당신은 반도체 및 정밀가공품의 비전검사 결과를 검토하는 품질 엔지니어입니다.
+
+아래에는 같은 검사 이미지의 원본과 YOLO 검출 결과 이미지가 제공됩니다.
+
+파일명: {filename}
+YOLO 신뢰도 기준: {confidence_threshold:.2f}
+YOLO 검출 결과:
+{detection_summary}
+
+다음 순서로 한국어로 분석하세요.
+
+1. YOLO 검출 결과 요약
+2. 검출된 위치와 형상 설명
+3. 이미지에서 육안으로 확인되는 이상 특징
+4. 가능한 원인 가설
+5. 추가로 확인할 측정·공정 항목
+6. 자동검사 결과 사용 시 주의사항
+
+중요:
+- YOLO 검출 결과를 사실로 단정하지 말고, 오검출 가능성을 함께 검토하세요.
+- 이미지에서 보이지 않는 재료, 공정, 치수 정보를 단정하지 마세요.
+- 검출이 없으면 '정상 확정'이라고 하지 말고, 현재 모델과 임계값에서 검출되지 않았다고 표현하세요.
+- 불량의 최종 판정은 사내 검사 기준과 측정 결과를 함께 확인해야 합니다.
+
+사용자 추가 요청:
+{user_request.strip() or "추가 요청 없음"}
+"""
+
+    original_bytes = image_to_jpeg_bytes(
+        original_image,
+        quality=92,
+    )
+    annotated_bytes = image_to_jpeg_bytes(
+        annotated_image,
+        quality=92,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=normalized_model,
+            contents=[
+                prompt,
+                types.Part.from_bytes(
+                    data=original_bytes,
+                    mime_type="image/jpeg",
+                ),
+                types.Part.from_bytes(
+                    data=annotated_bytes,
+                    mime_type="image/jpeg",
+                ),
+            ],
+        )
+
+    except Exception as error:
+        error_text = str(error)
+
+        if "404" in error_text or "NOT_FOUND" in error_text:
+            raise RuntimeError(
+                "선택한 Gemini 모델을 현재 API 키에서 사용할 수 없습니다. "
+                "왼쪽 모델 입력을 'gemini-flash-latest'로 변경하거나 "
+                "Google AI Studio에서 사용 가능한 모델명을 확인하세요.\n\n"
+                f"현재 요청 모델: {normalized_model}\n"
+                f"원본 오류: {error_text}"
+            ) from error
+
+        raise
+
+    if not response.text:
+        raise RuntimeError(
+            "Gemini에서 분석 텍스트를 받지 못했습니다."
+        )
+
+    return response.text
+
+
 def build_result_zip(
     annotated_images: list[Image.Image],
     filenames: list[str],
@@ -464,6 +601,34 @@ if torch.cuda.is_available():
 else:
     st.sidebar.info("Streamlit Cloud CPU로 검사합니다.")
 
+st.sidebar.divider()
+st.sidebar.header("Gemini 결과 분석")
+
+gemini_api_key = st.sidebar.text_input(
+    "Gemini API 키",
+    type="password",
+    help=(
+        "현재 Streamlit 세션에서만 사용합니다. "
+        "코드와 GitHub 저장소에는 저장하지 않습니다."
+    ),
+)
+
+gemini_model_name = st.sidebar.text_input(
+    "Gemini 모델명",
+    value="gemini-flash-latest",
+    help=(
+        "현재 API 키에서 사용할 수 있는 이미지 입력 지원 모델명을 입력하세요."
+    ),
+)
+
+gemini_user_request = st.sidebar.text_area(
+    "추가 분석 요청",
+    value=(
+        "검출 위치와 신뢰도를 품질팀 관점에서 해석하고 "
+        "추가 확인이 필요한 항목을 알려주세요."
+    ),
+)
+
 
 # ============================================================
 # 4. 이미지 업로드 및 검사
@@ -545,11 +710,16 @@ if run_button:
             )
 
             st.session_state["inference_results"] = {
+                "original_images": images,
                 "annotated_images": annotated_images,
                 "filenames": filenames,
                 "detection_rows": detection_rows,
                 "model_path": str(selected_model_path),
+                "confidence_threshold": float(confidence),
             }
+
+            # 새 검사 결과가 생성되면 이전 Gemini 해석은 초기화합니다.
+            st.session_state["gemini_analysis"] = None
 
         st.success("이미지 검사가 완료되었습니다.")
 
@@ -564,6 +734,7 @@ if run_button:
 saved_results = st.session_state.get("inference_results")
 
 if saved_results:
+    original_images = saved_results["original_images"]
     annotated_images = saved_results["annotated_images"]
     result_filenames = saved_results["filenames"]
     detection_rows = saved_results["detection_rows"]
@@ -605,6 +776,7 @@ if saved_results:
             "개별 결과",
             "전체 모음",
             "검출 데이터",
+            "Gemini 분석",
             "결과 다운로드",
         ]
     )
@@ -681,6 +853,99 @@ if saved_results:
         )
 
     with result_tabs[3]:
+        st.markdown("### Gemini API 검사 결과 분석")
+
+        st.info(
+            "원본 이미지, YOLO 검출 표시 이미지, 클래스·신뢰도·좌표를 함께 전달하여 "
+            "품질검사 관점의 보조 분석을 생성합니다."
+        )
+
+        gemini_target_index = st.selectbox(
+            "Gemini로 분석할 이미지",
+            options=list(range(len(result_filenames))),
+            format_func=lambda index: (
+                f"{index + 1}. {result_filenames[index]}"
+            ),
+            key="gemini_target_index",
+        )
+
+        gemini_col1, gemini_col2 = st.columns(2)
+
+        with gemini_col1:
+            st.image(
+                original_images[gemini_target_index],
+                caption="원본 이미지",
+                use_container_width=True,
+            )
+
+        with gemini_col2:
+            st.image(
+                annotated_images[gemini_target_index],
+                caption="YOLO 검출 결과",
+                use_container_width=True,
+            )
+
+        current_filename = result_filenames[gemini_target_index]
+
+        current_rows = [
+            row
+            for row in detection_rows
+            if row["파일명"] == current_filename
+        ]
+
+        st.dataframe(
+            pd.DataFrame(current_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if st.button(
+            "선택한 결과를 Gemini로 분석",
+            type="primary",
+            disabled=not gemini_api_key.strip(),
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner(
+                    "Gemini가 원본 이미지와 YOLO 검사 결과를 분석하고 있습니다."
+                ):
+                    analysis_text = analyze_yolo_result_with_gemini(
+                        api_key=gemini_api_key,
+                        model_name=gemini_model_name,
+                        original_image=original_images[gemini_target_index],
+                        annotated_image=annotated_images[gemini_target_index],
+                        filename=current_filename,
+                        detection_rows=detection_rows,
+                        confidence_threshold=float(
+                            saved_results.get(
+                                "confidence_threshold",
+                                confidence,
+                            )
+                        ),
+                        user_request=gemini_user_request,
+                    )
+
+                st.session_state["gemini_analysis"] = {
+                    "filename": current_filename,
+                    "text": analysis_text,
+                }
+
+                st.success("Gemini 분석이 완료되었습니다.")
+
+            except Exception as error:
+                st.exception(error)
+
+        gemini_analysis = st.session_state.get(
+            "gemini_analysis"
+        )
+
+        if gemini_analysis:
+            st.markdown(
+                f"#### 분석 대상: {gemini_analysis['filename']}"
+            )
+            st.markdown(gemini_analysis["text"])
+
+    with result_tabs[4]:
         contact_sheet_for_zip = create_contact_sheet(
             images=annotated_images,
             labels=result_filenames,
@@ -740,10 +1005,25 @@ with st.expander("GitHub 모델 연결 방법"):
 
         형태로 올리면 Streamlit 화면에서 모델을 선택할 수 있습니다.
 
+        ### Gemini 분석
+
+        왼쪽 사이드바에 Gemini API 키와 모델명을 입력하면,
+        원본 이미지와 YOLO 검출 결과를 함께 분석할 수 있습니다.
+
+        기본 모델명:
+
+        ```text
+        gemini-flash-latest
+        ```
+
+        API 키는 현재 실행 세션에서만 사용되며 GitHub에 저장되지 않습니다.
+
         ### 주의
 
         일반 GitHub 저장소는 단일 파일 100MB 제한이 있습니다.
         작은 YOLO 모델은 보통 저장할 수 있지만, 큰 모델은
         GitHub Release나 별도 모델 저장소 사용이 필요할 수 있습니다.
+
+        Gemini의 설명은 보조 분석이며 최종 품질 판정을 대신하지 않습니다.
         """
     )
